@@ -21,7 +21,23 @@ struct ModelProvider {
     name: String,
     api_base: String,
     model: String,
+    #[serde(default)]
+    models: Vec<String>,
     api_key: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct McpServerConfig {
+    id: String,
+    name: String,
+    transport: String,
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+    command: String,
+    args: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    enabled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -29,6 +45,8 @@ struct ModelProvider {
 struct AgentConfig {
     providers: Vec<ModelProvider>,
     active_provider_id: String,
+    system_prompt: String,
+    mcp_servers: Vec<McpServerConfig>,
     // Legacy fields are retained so existing installations migrate without losing settings.
     api_base: String,
     model: String,
@@ -61,9 +79,15 @@ fn normalize_config(mut config: AgentConfig) -> AgentConfig {
                 config.api_base.clone()
             },
             model: config.model.clone(),
+            models: if config.model.trim().is_empty() { Vec::new() } else { vec![config.model.clone()] },
             api_key: config.api_key.clone(),
         });
         config.active_provider_id = "default".into();
+    }
+    for provider in &mut config.providers {
+        if provider.models.is_empty() && !provider.model.trim().is_empty() { provider.models.push(provider.model.clone()); }
+        if provider.model.trim().is_empty() { provider.model = provider.models.first().cloned().unwrap_or_default(); }
+        if !provider.model.is_empty() && !provider.models.contains(&provider.model) { provider.models.insert(0, provider.model.clone()); }
     }
     if config.active_provider_id.is_empty() {
         config.active_provider_id = config
@@ -168,12 +192,13 @@ fn save_config(
     Ok(())
 }
 #[tauri::command]
-fn choose_project(app: tauri::AppHandle) -> Option<String> {
+async fn choose_project(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    app.dialog()
-        .file()
-        .blocking_pick_folder()
-        .map(|p| p.to_string())
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |folder| {
+        let _ = tx.send(folder.map(|path| path.to_string()));
+    });
+    rx.await.map_err(|e| format!("Folder picker failed: {e}"))
 }
 fn within(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(rel);
@@ -322,6 +347,14 @@ async fn read_stream_response(
                 let Ok(event) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                let delta_object = &event["choices"][0]["delta"];
+                let reasoning_delta = delta_object["reasoning_content"].as_str()
+                    .or_else(|| delta_object["reasoning"].as_str());
+                if let Some(delta) = reasoning_delta {
+                    if !delta.is_empty() {
+                        let _ = app.emit("agent-reasoning", json!({"session_id":session_id,"content":delta}));
+                    }
+                }
                 if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
                     if !delta.is_empty() {
                         content.push_str(delta);
@@ -362,6 +395,12 @@ async fn read_stream_response(
     if content.is_empty() && calls.is_empty() {
         if let Ok(body) = serde_json::from_str::<Value>(&raw_body) {
             if let Some(message) = body["choices"][0]["message"].as_object() {
+                if let Some(reasoning_text) = message.get("reasoning_content").and_then(Value::as_str)
+                    .or_else(|| message.get("reasoning").and_then(Value::as_str)) {
+                    if !reasoning_text.is_empty() {
+                        let _ = app.emit("agent-reasoning", json!({"session_id":session_id,"content":reasoning_text}));
+                    }
+                }
                 return Ok(Value::Object(message.clone()));
             }
             if body["error"].is_object() {
@@ -424,6 +463,7 @@ async fn run_task(
     ]);
     let tools = workspace_tools;
     let system_prompt = format!("You are Forge Agent, an autonomous coding assistant with access to the local machine. Use available tools even when no project folder is selected. When no folder is selected, use this default working directory: {}. You may access files outside a selected project when needed. Inspect before editing and explain actions briefly. The application will always ask the user to approve shell commands and file changes. Never claim an action succeeded unless the tool confirms it. Finish with a concise summary.", root.display());
+    let system_prompt = if config.system_prompt.trim().is_empty() { system_prompt } else { format!("{system_prompt}\n\nAdditional user instructions:\n{}", config.system_prompt.trim()) };
     let mut msgs = vec![json!({"role":"system","content":system_prompt})];
     for turn in conversation {
         if turn.role == "user" || turn.role == "assistant" {

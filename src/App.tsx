@@ -7,7 +7,7 @@ import { Activity, Bot, ChevronDown, FolderOpen, GitBranch, MessageSquarePlus, P
 import SettingsPage, { Config } from './Settings';
 
 type Status = { ready: boolean; platform: string; version: string };
-const empty: Config = { providers: [], active_provider_id: '', system_prompt: '', mcp_servers: [] };
+const empty: Config = { providers: [], active_provider_id: '', system_prompt: '', mcp_servers: [], skills: [] };
 type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string; reasoning?: string };
 type ChatSession = { id: string; title: string; messages: ChatMessage[]; updatedAt: number };
 const makeSession = (): ChatSession => ({ id: crypto.randomUUID(), title: 'New chat', messages: [], updatedAt: Date.now() });
@@ -37,7 +37,7 @@ export default function App() {
  const [cfg,setCfg]=useState<Config>(empty);
  const active=useMemo(()=>cfg.providers.find(p=>p.id===cfg.active_provider_id),[cfg]);
  useEffect(()=>{document.documentElement.dataset.theme=theme;localStorage.setItem('forge-theme',theme)},[theme]);
- useEffect(()=>{invoke<Status>('status').then(setStatus);invoke<Config>('get_config').then(c=>{const next={...empty,...c,providers:c.providers||[],mcp_servers:c.mcp_servers||[]};setCfg(next)}).catch(()=>{});const unlisten=listen<string>('agent-progress',e=>setLog(v=>v+'\n'+e.payload));return()=>{unlisten.then(f=>f())}},[]);
+ useEffect(()=>{invoke<Status>('status').then(setStatus);invoke<Config>('get_config').then(c=>{const next={...empty,...c,providers:c.providers||[],mcp_servers:c.mcp_servers||[],skills:c.skills||[]};setCfg(next)}).catch(()=>{});const unlisten=listen<string>('agent-progress',e=>setLog(v=>v+'\n'+e.payload));return()=>{unlisten.then(f=>f())}},[]);
  useEffect(()=>{const unlisten=listen<{session_id:string;content:string}>('agent-token',e=>updateSession(e.payload.session_id,s=>({...s,messages:s.messages.map((m,i)=>i===s.messages.length-1&&m.role==='assistant'?{...m,content:m.content+e.payload.content}:m)})));return()=>{unlisten.then(f=>f())}},[]);
  useEffect(()=>{const unlisten=listen<{session_id:string;content:string}>('agent-reasoning',e=>updateSession(e.payload.session_id,s=>({...s,messages:s.messages.map((m,i)=>i===s.messages.length-1&&m.role==='assistant'?{...m,reasoning:(m.reasoning||'')+e.payload.content}:m)})));return()=>{unlisten.then(f=>f())}},[]);
  async function pick(){try{const p=await invoke<string|null>('choose_project');if(p)setProject(p)}catch(e){setLog(String(e))}}

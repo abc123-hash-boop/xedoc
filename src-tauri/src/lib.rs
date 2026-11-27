@@ -42,11 +42,22 @@ struct McpServerConfig {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+struct AgentSkill {
+    id: String,
+    name: String,
+    description: String,
+    instructions: String,
+    enabled: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct AgentConfig {
     providers: Vec<ModelProvider>,
     active_provider_id: String,
     system_prompt: String,
     mcp_servers: Vec<McpServerConfig>,
+    skills: Vec<AgentSkill>,
     // Legacy fields are retained so existing installations migrate without losing settings.
     api_base: String,
     model: String,
@@ -417,6 +428,34 @@ async fn read_stream_response(
     }
     Ok(message)
 }
+fn load_workspace_skills(root: &Path) -> Vec<(String, String, String)> {
+    let mut found = Vec::new();
+    let skills_dir = root.join(".agents").join("skills");
+    let Ok(entries) = fs::read_dir(skills_dir) else { return found; };
+    for entry in entries.flatten().take(50) {
+        let path = entry.path().join("SKILL.md");
+        if !path.is_file() { continue; }
+        let Ok(content) = fs::read_to_string(&path) else { continue; };
+        if content.len() > 64 * 1024 { continue; }
+        let folder_name = entry.file_name().to_string_lossy().to_string();
+        let mut name = folder_name.clone();
+        let mut description = String::new();
+        let mut instructions = content.as_str();
+        if let Some(rest) = content.strip_prefix("---") {
+            if let Some(end) = rest.find("\n---") {
+                let frontmatter = &rest[..end];
+                for line in frontmatter.lines() {
+                    if let Some(value) = line.strip_prefix("name:") { name = value.trim().trim_matches('"').to_string(); }
+                    if let Some(value) = line.strip_prefix("description:") { description = value.trim().trim_matches('"').to_string(); }
+                }
+                instructions = rest[end + 4..].trim_start();
+            }
+        }
+        found.push((name, description, instructions.to_string()));
+    }
+    found
+}
+
 #[tauri::command]
 async fn run_task(
     app: tauri::AppHandle,
@@ -463,7 +502,14 @@ async fn run_task(
     ]);
     let tools = workspace_tools;
     let system_prompt = format!("You are Forge Agent, an autonomous coding assistant with access to the local machine. Use available tools even when no project folder is selected. When no folder is selected, use this default working directory: {}. You may access files outside a selected project when needed. Inspect before editing and explain actions briefly. The application will always ask the user to approve shell commands and file changes. Never claim an action succeeded unless the tool confirms it. Finish with a concise summary.", root.display());
-    let system_prompt = if config.system_prompt.trim().is_empty() { system_prompt } else { format!("{system_prompt}\n\nAdditional user instructions:\n{}", config.system_prompt.trim()) };
+    let mut system_prompt = if config.system_prompt.trim().is_empty() { system_prompt } else { format!("{system_prompt}\n\nAdditional user instructions:\n{}", config.system_prompt.trim()) };
+    let enabled_skills: Vec<&AgentSkill> = config.skills.iter().filter(|skill| skill.enabled && !skill.instructions.trim().is_empty()).collect();
+    let workspace_skills = load_workspace_skills(&root);
+    if !enabled_skills.is_empty() || !workspace_skills.is_empty() {
+        system_prompt.push_str("\n\n# Available Agent Skills\nUse a skill when its description matches the task. Skills do not override safety requirements or explicit user instructions.");
+        for skill in enabled_skills { system_prompt.push_str(&format!("\n\n## {}\nDescription: {}\n\n{}", skill.name, skill.description, skill.instructions)); }
+        for (name, description, instructions) in workspace_skills { system_prompt.push_str(&format!("\n\n## {} (workspace skill)\nDescription: {}\n\n{}", name, description, instructions)); }
+    }
     let mut msgs = vec![json!({"role":"system","content":system_prompt})];
     for turn in conversation {
         if turn.role == "user" || turn.role == "assistant" {
